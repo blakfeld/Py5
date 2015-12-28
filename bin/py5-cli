@@ -1,0 +1,522 @@
+#!/usr/bin/env python
+"""
+CLI controller for Py5 to interact and perform actions against
+    an F5 load banalcer.
+
+A user may either supply command line arguments, or a YAML
+    config file. The config file may either be located in
+    the same directory as this script (as py5.conf),
+    in a user's home directory (as .py5), or a user may
+    provide one on the command line using the '--config-file'
+    option.
+
+The py5.conf or .py5 file should generally look like:
+
+    py5:
+        server: 'xxx.xxx.xxx.xxx'
+        username: 'username'
+        password: 'password'
+        verify_ssl: True
+
+Author: Corwin Brown
+"""
+
+import os
+import re
+import sys
+import yaml
+import json
+import getpass
+import argparse
+import signal
+try:
+    from py5 import iControlREST
+except ImportError:
+    sys.path.append(
+        os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+    from py5 import iControlREST
+
+
+class ErrorHelpParser(argparse.ArgumentParser):
+    """
+    By default, argparse doesn't print the help message on an error.
+        That's kind of dumb, so I'm going to override it's error method.
+    """
+
+    def error(self, msg):
+        sys.stderr.write('\n**** error: {} ****\n\n'.format(msg))
+        self.print_help()
+        sys.exit(1)
+
+
+def handle_interrupt(signal, frame):
+    """
+    Handle SIGINT (Ctrl+C)
+    """
+
+    print('\n**** SIGINT caught! Exiting!\n****')
+    sys.exit()
+
+
+def get_script_path():
+    """
+    Return the file path of this script
+    """
+
+    return os.path.dirname(os.path.realpath(__file__))
+
+
+def get_args():
+    """
+    Get command line args
+    """
+
+    parser = ErrorHelpParser(description="A thin wrappper to interact with "
+                                         "the F5's REST API")
+
+    # Config Options
+    parser.add_argument('-u', '--username',
+                        help='Username with which to attempt login')
+    parser.add_argument('-p', '--password',
+                        help='Password with which to attempt login')
+    parser.add_argument('-s', '--server',
+                        help='IP address or hostname of F5')
+    parser.add_argument('-k', '--insecure',
+                        action='store_true',
+                        help='Ensure secure connection.')
+    parser.add_argument('-y', '--skip-confirm',
+                        action='store_true',
+                        help='Skip confirm dialogs')
+    parser.add_argument('--config',
+                        help='Specify a config file')
+
+    # Commands
+    # Ensure we can't chain commands together
+    #   Ain't nobody got time for that
+    commands = parser.add_mutually_exclusive_group()
+    commands.add_argument('--list-nodes',
+                          action='store_true',
+                          help='List all nodes on F5')
+    commands.add_argument('--list-pools',
+                          action='store_true',
+                          help='List all pools on F5')
+    commands.add_argument('--list-pools-in-partition',
+                          metavar='PARTITION_NAME',
+                          help='List all pools in a particular partition')
+    commands.add_argument('--list-partitions',
+                          action='store_true',
+                          help='List all Partitions/Folders on F5')
+    commands.add_argument('--list-pool-members',
+                          metavar='POOL_NAME',
+                          help='List all members of that pool')
+    commands.add_argument('--node-stats',
+                          metavar='NODE_NAME',
+                          help='List stats for a specific node')
+    commands.add_argument('--pool-stats',
+                          metavar='POOL_NAME',
+                          help='List stats for a specific pool')
+    commands.add_argument('--add-node-to-pool',
+                          nargs=2,
+                          metavar=('NODE_NAME:PORT', 'POOL_NAME'),
+                          help='Add node to a pool (Must include port in '
+                               'node name -- Node_Name:80)')
+    commands.add_argument('--remove-node-from-pool',
+                          nargs=2,
+                          metavar=('NODE_NAME', 'POOL_NAME'),
+                          help='Remove a node from a pool')
+    commands.add_argument('--disable-node',
+                          metavar='NODE_NAME',
+                          help='De-VIP a node')
+    commands.add_argument('--enable-node',
+                          metavar='NODE_NAME',
+                          help='Re-VIP a node')
+    commands.add_argument('--disable-pool-member',
+                          nargs=2,
+                          metavar=('POOL_NAME', 'MEMBER_NAME'),
+                          help='Disable a node at the pool level')
+    commands.add_argument('--enable-pool-member',
+                          nargs=2,
+                          metavar=('POOL_NAME', 'MEMBER_NAME'),
+                          help='Enable a node at the pool level')
+    commands.add_argument('--create-node',
+                          nargs=2,
+                          metavar=('NODE_NAME', 'NODE_ADDRESS'),
+                          help='Create new node')
+    commands.add_argument('--modify-node',
+                          nargs=3,
+                          metavar=('NODE_NAME', 'NODE_KEY', 'NODE_VALUE'),
+                          help='Modify an attribute on a node. This takes a '
+                               'key value pair, so to change the name you '
+                               'would provide: name $NEW_NAME')
+    commands.add_argument('--delete-node',
+                          metavar='NODE_NAME',
+                          help='Delete a node')
+    commands.add_argument('--create-pool',
+                          metavar='POOL_NAME',
+                          help='Create new pool')
+    commands.add_argument('--modify-pool',
+                          nargs=3,
+                          metavar=('POOL_NAME', 'POOL_KEY', 'POOL_VALUE'),
+                          help='Modify an attribute on a pool. This takes a '
+                               'key value pair, so to change the name you '
+                               'would provide: name $NEW_NAME')
+    commands.add_argument('--delete-pool',
+                          metavar='POOL_NAME',
+                          help='Delete pool')
+    commands.add_argument('--create-partition',
+                          metavar='PARTITION_NAME',
+                          help='Create new partition')
+    commands.add_argument('--delete-partition',
+                          metavar='PARTITION_NAME',
+                          help='Delete partition')
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(1)
+
+    return parser.parse_args()
+
+
+def get_config_file(override_file=None):
+    """
+    There are two potential config fies. A 'Global' one that
+        resides in the same directory as this script as
+        'py5.conf, or a 'personal' one that resides in a
+        user's home directory as '.py5'
+
+    Command line arguments take precedence, .py5 takes precedence over
+        py5.conf, but neither config file is required.
+
+    It's also possible to specify a different config file in
+        the command line args.
+    """
+
+    if override_file:
+        if os.path.exists(override_file):
+            config_file = override_file
+        else:
+            print('{} does not exist!!!'.format(override_file))
+            sys.exit(1)
+    else:
+        dot_py5 = os.path.join(os.path.expanduser('~'), '.py5')
+        py5_conf = os.path.join(get_script_path(), 'py5.conf')
+        if os.path.exists(dot_py5):
+            config_file = dot_py5
+        elif os.path.exists(py5_conf):
+            config_file = py5_conf
+
+    if config_file:
+        with open(config_file, 'r') as f:
+            config = yaml.load(f.read())
+
+        if config and 'py5' in config:
+            config = config['py5']
+            return config
+        else:
+            print('\n **** Improperly formatted config! '
+                  'Check out the README for a config example! ****\n')
+
+    # Return default config
+    return {'server': '',
+            'username': '',
+            'password': '',
+            'verify_ssl': True}
+
+
+def parse_output(output):
+    """
+    This code needs to produce machine readable text, so I'm
+        offloading parsing output to this method in case for
+        whatever reason JSON doesn't fit our needs.
+    """
+
+    return json.dumps(output, indent=4)
+
+
+def get_config():
+    """
+    Lint and parse out the proper config, to avoid having
+        this junk up main.
+    """
+
+    args = get_args()
+    config = get_config_file(args.config)
+
+    if args.username:
+        config['username'] = args.username
+        if not args.password:
+            config['password'] = getpass.getpass()
+        else:
+            config['password'] = args.password
+
+    if args.password and not args.username:
+        print('Password requires a username!')
+        sys.exit(1)
+
+    # If we still don't have a pssword by now, ask for it
+    if not config['password']:
+        config['password'] = getpass.getpass()
+
+    if args.server:
+        config['server'] = args.server
+
+    if args.insecure:
+        config['verify_ssl'] = False
+
+    if (not config['server'] or
+            not config['username'] or
+            not config['password']):
+
+        print('\n**** Server, username, and password are required! ****\n')
+        sys.exit(1)
+
+    return args, config
+
+
+def confirm_action(prompt, skip, default='y'):
+    """
+    Ask user to confirm before committing potentially destructive actions.
+    """
+
+    if not skip:
+        prompt = '{} [y|n] (default: {}): '.format(prompt, default)
+        while True:
+            confirm = raw_input(prompt).lower()
+            if not confirm:
+                confirm = default
+            elif confirm == 'y' or confirm == 'yes':
+                break
+            elif confirm == 'n' or confirm == 'no':
+                print('\n**** Exiting! ****\n')
+                sys.exit()
+            else:
+                print('Please enter either y (yes) or n (no).')
+
+
+def attempt_to_find_port(py5, pool_name, member_name):
+    """
+    The F5 bombs real hard if you don't give it a port name.
+        Lets try to find it if its not supplied.
+    """
+
+    members = py5.get_pool_members(pool_name)
+    for member in members['items']:
+        if ':' in member['name']:
+            name, port = member['name'].split(':')
+            if name == member_name:
+                return port
+
+
+def main():
+    """
+    Main
+    """
+
+    signal.signal(signal.SIGINT, handle_interrupt)
+    args, config = get_config()
+    py5 = iControlREST(server=config['server'],
+                       username=config['username'],
+                       password=config['password'],
+                       verify=config['verify_ssl'],
+                       debug=True)
+
+    # TODO: Clean this up
+    # Nasty chain of commands
+    if args.list_nodes:
+        output = py5.get_all_nodes()
+
+    elif args.list_pools:
+        output = py5.get_all_pools()
+
+    elif args.list_pools_in_partition:
+        pool_name = args.list_pools_in_partition
+        output = py5.get_all_pools_in_partition(pool_name)
+
+    elif args.list_partitions:
+        output = py5.get_all_partitions()
+
+    elif args.list_pool_members:
+        pool_name = args.list_pool_members
+        output = py5.get_pool_members(pool_name)
+
+    elif args.node_stats:
+        node_name = args.node_stats
+        output = py5.get_node_stats(node_name)
+
+    elif args.pool_stats:
+        pool_name = args.pool_stats
+        output = py5.get_pool_stats(pool_name)
+
+    elif args.add_node_to_pool:
+        pool_name = args.add_node_to_pool[1]
+        node_name = args.add_node_to_pool[0]
+        confirm_action('Add {} to {}?'.format(node_name, pool_name),
+                       args.skip_confirm)
+
+        if ':' not in node_name:
+            port = attempt_to_find_port(py5, pool_name, node_name)
+            if port:
+                node_name = '{}:{}'.format(node_name, port)
+            else:
+                print('\n**** Node names must include a port in the name! '
+                      '(NODE_NAME:PORT) ****\n')
+
+        new_member = [{'name': node_name}]
+        output = py5.add_members_to_pool(target_pool=pool_name,
+                                         new_members=new_member)
+
+    elif args.remove_node_from_pool:
+        pool_name = args.remove_node_from_pool[1]
+        node_name = args.remove_node_from_pool[0]
+        confirm_action('Remove {} from {}?'.format(node_name, pool_name),
+                       args.skip_confirm)
+
+        output = py5.remove_member_from_pool(target_pool=pool_name,
+                                             member_name=node_name)
+
+    elif args.disable_node:
+        node_name = args.disable_node
+        confirm_action('Disable node {}?'.format(node_name),
+                       args.skip_confirm)
+
+        output = py5.disable_node(name=node_name)
+
+    elif args.enable_node:
+        node_name = args.enable_node
+        confirm_action('Enable node {}?'.format(node_name),
+                       args.skip_confirm)
+
+        output = py5.enable_node(name=node_name)
+
+    elif args.disable_pool_member:
+        pool_name = args.disable_pool_member[0]
+        node_name = args.disable_pool_member[1]
+
+        confirm_action('Disable node {} in pool {}?'.format(node_name,
+                                                            pool_name),
+                       args.skip_confirm)
+
+        if ':' not in node_name:
+            port = attempt_to_find_port(py5, pool_name, node_name)
+            if port:
+                node_name = '{}:{}'.format(node_name, port)
+            else:
+                print('\n**** A port number is required! '
+                      '(NODE_NAME:PORT) ****\n')
+                sys.exit(1)
+
+        output = py5.disable_pool_member(name=pool_name, member_name=node_name)
+
+    elif args.enable_pool_member:
+        pool_name = args.enable_pool_member[0]
+        node_name = args.enable_pool_member[1]
+
+        confirm_action('Enable node {} in pool {}?'.format(node_name,
+                                                           pool_name),
+                       args.skip_confirm)
+
+        if ':' not in node_name:
+            port = attempt_to_find_port(py5, pool_name, node_name)
+            if port:
+                node_name = '{}:{}'.format(node_name, port)
+            else:
+                print('\n**** A port number is required! '
+                      '(NODE_NAME:PORT) ****\n')
+                sys.exit(1)
+
+        output = py5.enable_pool_member(name=pool_name, member_name=node_name)
+
+    elif args.create_node:
+        node_name = args.create_node[0]
+        node_address = args.create_node[1]
+        confirm_action('Create node {} with address {}?'.format(node_name,
+                                                                node_address),
+                       args.skip_confirm)
+
+        ip_regex = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+        if not re.match(ip_regex, node_address):
+            print('\n**** The second argument must be an IP address! ****\n')
+            sys.exit(1)
+
+        output = py5.create_node(name=args.create_node[0],
+                                 address=args.create_node[1])
+
+    elif args.modify_node:
+        node_name = args.modify_node[0]
+        target_attr = args.modify_node[1]
+        new_attr = args.modify_node[2]
+        confirm_action('Change {} to {} on node {}?'.format(target_attr,
+                                                            new_attr,
+                                                            node_name),
+                       args.skip_confirm)
+
+        mod_attrs = {'name': node_name}
+        mod_attrs[target_attr] = new_attr
+
+        output = py5.modify_node(**mod_attrs)
+
+    elif args.delete_node:
+        node_name = args.delete_node
+        confirm_action('Delete node {}?'.format(node_name),
+                       args.skip_confirm,
+                       default='n')
+
+        output = py5.delete_node(name=node_name)
+
+    elif args.create_pool:
+        pool_name = args.create_pool
+        confirm_action('Create new pool {}?'.format(pool_name),
+                       args.skip_confirm)
+
+        output = py5.create_pool(name=args.create_pool)
+
+    elif args.modify_pool:
+        pool_name = args.modify_pool[0]
+        target_attr = args.modify_pool[1]
+        new_attr = args.modify_pool[2]
+        confirm_action('Change {} to {} on pool {}?'.format(target_attr,
+                                                            new_attr,
+                                                            pool_name),
+                       args.skip_confirm)
+        mod_attrs = {'name': pool_name}
+        mod_attrs[target_attr] = new_attr
+
+        output = py5.modify_pool(**mod_attrs)
+
+    elif args.delete_pool:
+        pool_name = args.delete_pool
+        confirm_action('Delete pool {}?'.format(pool_name),
+                       args.skip_confirm,
+                       default='n')
+
+        output = py5.delete_pool(name=args.delete_pool)
+
+    elif args.create_partition:
+        partition_name = args.create_partition
+        confirm_action('Create new partition {}?'.format(partition_name),
+                       args.skip_confirm)
+
+        output = py5.create_partition(name=args.create_partition)
+
+    elif args.delete_partition:
+        partition_name = args.delete_partition
+        confirm_action('Delete partition {}?'.format(partition_name),
+                       args.skip_confirm,
+                       default='n')
+
+        if args.create_partition == 'Common':
+            print('\n**** You cannot delete the "Common" partition! ****\n')
+            sys.exit(1)
+
+        output = py5.delete_partition(name=args.delete_partition)
+
+    else:
+        print('\n**** You must specify an action and a target! '
+              'Use --help for help! ****\n')
+        sys.exit(1)
+
+    print('\n{}\n'.format(parse_output(output)))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
